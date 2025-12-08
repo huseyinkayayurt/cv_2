@@ -2,14 +2,11 @@ import cv2
 import numpy as np
 
 INPUT_VIDEO  = "input.mp4"
-OUTPUT_VIDEO = ""   # İstersen boş bırakıp kaydetmeyebilirsin
+OUTPUT_VIDEO = ""   # İstersen boş bırakıp kaydedebilirsin
 
 def order_points(pts):
     """
     pts: (N,2) noktalar. Çıktı sırası: tl, tr, br, bl
-    Daha sağlam yöntem:
-      1) y'ye göre sırala (üst 2, alt 2)
-      2) her grubu x'e göre sırala (sol, sağ)
     """
     pts = np.array(pts, dtype="float32")
 
@@ -84,12 +81,10 @@ def compute_perspective_transform(table_corners):
     """
     (tl, tr, br, bl) = table_corners
 
-    # Genişlikler
     widthA = np.linalg.norm(br - bl)
     widthB = np.linalg.norm(tr - tl)
     maxWidth = int(max(widthA, widthB))
 
-    # Yükseklikler
     heightA = np.linalg.norm(tr - br)
     heightB = np.linalg.norm(tl - bl)
     maxHeight = int(max(heightA, heightB))
@@ -109,6 +104,74 @@ def compute_perspective_transform(table_corners):
 
     M = cv2.getPerspectiveTransform(table_corners, dst)
     return M, maxWidth, maxHeight
+
+def detect_white_ball(warped, prev_center=None):
+    """
+    warped masa görüntüsünde beyaz topu tespit etmeye çalışır.
+    Dönen: (cx, cy, r) veya None
+    """
+    hsv = cv2.cvtColor(warped, cv2.COLOR_BGR2HSV)
+
+    # Beyaz için yaklaşık aralık: düşük S, yüksek V
+    # Bunlarla oynaman gerekebilir (ışığa göre)
+    lower_white = np.array([0,   0, 200])
+    upper_white = np.array([180, 60, 255])
+
+    mask = cv2.inRange(hsv, lower_white, upper_white)
+
+    # Gürültü temizliği
+    kernel = np.ones((3, 3), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL,
+                                   cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None
+
+    best_candidate = None
+    best_score = -1
+
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        if area < 20 or area > 1000:
+            continue  # çok küçük / çok büyük gürültüleri at
+
+        perimeter = cv2.arcLength(cnt, True)
+        if perimeter == 0:
+            continue
+
+        circularity = 4 * np.pi * area / (perimeter * perimeter)
+
+        # Daireye yakınlık filtresi
+        if circularity < 0.6:
+            continue
+
+        (x, y), radius = cv2.minEnclosingCircle(cnt)
+        center = (int(x), int(y))
+
+        # Eğer önceki frame'de bir merkez varsa, ona yakın olanı tercih et
+        score = circularity
+        if prev_center is not None:
+            dist = np.linalg.norm(np.array(center) - np.array(prev_center))
+            score = circularity - 0.001 * dist  # biraz uzaklık penalizesi
+
+        if score > best_score:
+            best_score = score
+            best_candidate = (center, radius)
+
+    if best_candidate is None:
+        return None
+
+    (center, radius) = best_candidate
+    return (center[0], center[1], radius)
+
+def warp_to_original(M_inv, x_w, y_w):
+    """Warped koordinatını homografinin tersiyle orijinal frame'e map eder."""
+    pt = np.array([x_w, y_w, 1.0], dtype=np.float32).reshape(3, 1)
+    dst = M_inv @ pt
+    dst /= dst[2, 0]  # homojen normalize
+    return int(dst[0, 0]), int(dst[1, 0])
 
 def main():
     cap = cv2.VideoCapture(INPUT_VIDEO)
@@ -136,6 +199,8 @@ def main():
         cap.release()
         return
 
+    M_inv = np.linalg.inv(M)
+
     # Video özellikleri
     fps    = cap.get(cv2.CAP_PROP_FPS)
     width  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -150,23 +215,40 @@ def main():
     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
 
     table_corners_int = table_corners.astype(int)
+    prev_center_warp = None  # önceki frame'deki top merkezi (warped)
 
     while True:
         ret, frame = cap.read()
         if not ret:
             break
 
-        # 1) Orijinal görüntüde masayı işaretle
+        # 1) Orijinal masayı işaretle
         cv2.polylines(frame, [table_corners_int], isClosed=True,
                       color=(0, 0, 255), thickness=3)
         for (x, y) in table_corners_int:
-            cv2.circle(frame, (x, y), 6, (255, 0, 0), -1)
+            cv2.circle(frame, (x, y), 4, (255, 0, 0), -1)
 
-        # 2) Tepeden görünüm: masa perspektif düzeltme
+        # 2) Tepeden görünüm
         warped = cv2.warpPerspective(frame, M, (warp_w, warp_h))
 
-        cv2.imshow("Bilardo Masasi Isaretli Video", frame)
-        cv2.imshow("Masa Tepeden (Warped)", warped)
+        # 3) Warped üzerinde beyaz topu ara
+        ball = detect_white_ball(warped, prev_center=prev_center_warp)
+        if ball is not None:
+            cx_w, cy_w, r_w = ball
+            prev_center_warp = (cx_w, cy_w)
+
+            # Warped görüntüde çiz
+            cv2.circle(warped, (cx_w, cy_w), int(r_w), (0, 0, 255), 2)
+            cv2.circle(warped, (cx_w, cy_w), 3, (0, 255, 0), -1)
+
+            # Orijinale geri projeksiyon
+            x_o, y_o = warp_to_original(M_inv, cx_w, cy_w)
+            cv2.circle(frame, (x_o, y_o), 10, (0, 255, 255), 2)
+            cv2.circle(frame, (x_o, y_o), 4, (0, 255, 255), -1)
+
+        # Göster
+        cv2.imshow("Orijinal (Masa + Top Takibi)", frame)
+        cv2.imshow("Masa Tepeden (Warped + Top)", warped)
 
         if writer is not None:
             writer.write(frame)
