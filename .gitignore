@@ -48,3 +48,6 @@ venv.bak/
 # Pickle files (genellikle büyük olabilir)
 *.pkl
 *.pickle
+
+frames_backup/
+input.mp4
