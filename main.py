@@ -5,17 +5,30 @@ INPUT_VIDEO  = "input.mp4"
 OUTPUT_VIDEO = ""   # İstersen boş bırakıp kaydetmeyebilirsin
 
 def order_points(pts):
-    rect = np.zeros((4, 2), dtype="float32")
+    """
+    pts: (N,2) noktalar. Çıktı sırası: tl, tr, br, bl
+    Daha sağlam yöntem:
+      1) y'ye göre sırala (üst 2, alt 2)
+      2) her grubu x'e göre sırala (sol, sağ)
+    """
+    pts = np.array(pts, dtype="float32")
 
-    s = pts.sum(axis=1)
-    rect[0] = pts[np.argmin(s)]  # top-left
-    rect[2] = pts[np.argmax(s)]  # bottom-right
+    # y'ye göre sırala (küçük y = üst)
+    idx_by_y = np.argsort(pts[:, 1])
+    pts_sorted = pts[idx_by_y]
 
-    diff = np.diff(pts, axis=1)
-    rect[1] = pts[np.argmin(diff)]  # top-right
-    rect[3] = pts[np.argmax(diff)]  # bottom-left
+    top = pts_sorted[:2]
+    bottom = pts_sorted[2:]
 
-    return rect
+    # üsttekileri x'e göre sırala -> tl, tr
+    top = top[np.argsort(top[:, 0])]
+    tl, tr = top
+
+    # alttakileri x'e göre sırala -> bl, br
+    bottom = bottom[np.argsort(bottom[:, 0])]
+    bl, br = bottom
+
+    return np.array([tl, tr, br, bl], dtype="float32")
 
 def detect_table(frame):
     """İlk frame üzerinde MAVİ masayı tespit eder, 4 köşe döner."""
@@ -59,8 +72,43 @@ def detect_table(frame):
         print("4 köşe bulunamadı, masayı dikdörtgen gibi modelleyemedik.")
         return None
 
-    ordered = order_points(pts.astype("float32"))
+    ordered = order_points(pts)
+    print("[DEBUG] Masa köşeleri (tl, tr, br, bl):")
+    print(ordered)
     return ordered
+
+def compute_perspective_transform(table_corners):
+    """
+    Masa köşelerinden homografi matrisi ve çıktı boyutlarını hesaplar.
+    table_corners: (4,2) float32, sırası: tl, tr, br, bl
+    """
+    (tl, tr, br, bl) = table_corners
+
+    # Genişlikler
+    widthA = np.linalg.norm(br - bl)
+    widthB = np.linalg.norm(tr - tl)
+    maxWidth = int(max(widthA, widthB))
+
+    # Yükseklikler
+    heightA = np.linalg.norm(tr - br)
+    heightB = np.linalg.norm(tl - bl)
+    maxHeight = int(max(heightA, heightB))
+
+    if maxWidth < 10 or maxHeight < 10:
+        print(f"[WARN] Hesaplanan masa boyutları çok küçük: {maxWidth}x{maxHeight}")
+        return None, None, None
+
+    print(f"[DEBUG] Warp size: {maxWidth} x {maxHeight}")
+
+    dst = np.array([
+        [0, 0],
+        [maxWidth - 1, 0],
+        [maxWidth - 1, maxHeight - 1],
+        [0, maxHeight - 1]
+    ], dtype="float32")
+
+    M = cv2.getPerspectiveTransform(table_corners, dst)
+    return M, maxWidth, maxHeight
 
 def main():
     cap = cv2.VideoCapture(INPUT_VIDEO)
@@ -81,18 +129,24 @@ def main():
         cap.release()
         return
 
+    # Homografi ve çıktı boyutları
+    M, warp_w, warp_h = compute_perspective_transform(table_corners)
+    if M is None:
+        print("Homografi hesaplanamadı, perspektif düzeltme iptal.")
+        cap.release()
+        return
+
     # Video özellikleri
     fps    = cap.get(cv2.CAP_PROP_FPS)
     width  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-    # VideoWriter (istersen kapatmak için OUTPUT_VIDEO = "" yapabilirsin)
     writer = None
     if OUTPUT_VIDEO:
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
         writer = cv2.VideoWriter(OUTPUT_VIDEO, fourcc, fps, (width, height))
 
-    # İlk frame’i tekrar kullanmak için pozisyonu başa sar
+    # Videoyu başa sar
     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
 
     table_corners_int = table_corners.astype(int)
@@ -102,19 +156,21 @@ def main():
         if not ret:
             break
 
-        # Masayı video akışı bozulmadan aynı köşelerle çiz
+        # 1) Orijinal görüntüde masayı işaretle
         cv2.polylines(frame, [table_corners_int], isClosed=True,
                       color=(0, 0, 255), thickness=3)
-
         for (x, y) in table_corners_int:
             cv2.circle(frame, (x, y), 6, (255, 0, 0), -1)
 
-        # Ekrana göster (q ile çık)
+        # 2) Tepeden görünüm: masa perspektif düzeltme
+        warped = cv2.warpPerspective(frame, M, (warp_w, warp_h))
+
         cv2.imshow("Bilardo Masasi Isaretli Video", frame)
+        cv2.imshow("Masa Tepeden (Warped)", warped)
+
         if writer is not None:
             writer.write(frame)
 
-        # 1 ms bekle – fps’yi çok bozmaz, ESC için kontrol
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
 
