@@ -132,6 +132,98 @@ def find_rallies(
     return rallies, final_sep_indices, total_frames
 
 
+def detect_table_roi(frame, margin: int = 8):
+    """
+    Bilardo masasının oyun alanını (turkuaz kumaş kısmı) otomatik tespit eder.
+    Dönen:
+        roi = {
+            "outer": (x, y, w, h),   # kumaşın boundingRect'i
+            "inner": (ix, iy, iw, ih),  # margin kadar içeri kaydırılmış dikdörtgen
+            "bands": {
+                "left":   ix,
+                "right":  ix + iw - 1,
+                "top":    iy,
+                "bottom": iy + ih - 1,
+            }
+        }
+        mask : masa maskesi (debug için)
+    """
+
+    # BGR -> HSV
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+
+    # Masa rengi: turkuaz/mavi. Bu aralık video için test edilip seçildi.
+    # Gerekirse bu sınırlarla oynayabiliriz.
+    lower_table = np.array([85, 80, 80], dtype=np.uint8)
+    upper_table = np.array([110, 255, 255], dtype=np.uint8)
+
+    mask = cv2.inRange(hsv, lower_table, upper_table)
+
+    # Gürültüyü azaltmak için morfoloji
+    kernel = np.ones((5, 5), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+
+    # En büyük konturu masa kabul ediyoruz
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        raise RuntimeError("Masa konturu bulunamadı, HSV aralığını güncellemek gerekebilir.")
+
+    table_contour = max(contours, key=cv2.contourArea)
+    x, y, w, h = cv2.boundingRect(table_contour)
+
+    # Ahşap kenarlara değmemek için margin kadar içeri giriyoruz
+    ix = x + margin
+    iy = y + margin
+    iw = max(1, w - 2 * margin)
+    ih = max(1, h - 2 * margin)
+
+    roi = {
+        "outer": (x, y, w, h),
+        "inner": (ix, iy, iw, ih),
+        "bands": {
+            "left": ix,
+            "right": ix + iw - 1,
+            "top": iy,
+            "bottom": iy + ih - 1,
+        },
+    }
+
+    return roi, mask
+
+def get_frame_at(video_path: str, frame_idx: int):
+    """Belirli indexteki frame'i okur."""
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise RuntimeError(f"Video açılamadı: {video_path}")
+
+    cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+    ret, frame = cap.read()
+    cap.release()
+
+    if not ret or frame is None:
+        raise RuntimeError(f"{frame_idx} indexli frame okunamadı.")
+
+    return frame
+
+
+def visualize_table_roi(video_path: str, sample_idx: int, roi):
+    """ROI'yi çizip ekranda gösterir (sadece debug amaçlı)."""
+    frame = get_frame_at(video_path, sample_idx)
+
+    vis = frame.copy()
+    ox, oy, ow, oh = roi["outer"]
+    ix, iy, iw, ih = roi["inner"]
+
+    # Dış boundingRect (kumaş alanı) - kırmızı
+    cv2.rectangle(vis, (ox, oy), (ox + ow, oy + oh), (0, 0, 255), 2)
+    # İç oyun alanı - yeşil
+    cv2.rectangle(vis, (ix, iy), (ix + iw, iy + ih), (0, 255, 0), 2)
+
+    cv2.imshow("Table ROI (outer=red, inner=green)", vis)
+    print("ROI görüntülendi. Pencereyi kapatmak için herhangi bir tuşa bas.")
+    cv2.waitKey(0)
+    cv2.destroyAllWindows()
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description="3 top bilardo videosunda ralli sınırlarını separator template'ine göre bulur."
@@ -153,13 +245,40 @@ def main():
         args.template,
         match_threshold=args.match_threshold,
         expand_frames=args.expand_frames,
+        min_rally_length=args.min_rally_length,
         debug_every_n=args.debug_n
     )
     print(f"Bulunan ralli sayısı: {len(rallies)}")
 
     for i, (start, end) in enumerate(rallies, start=1):
         print(f"Ralli {i}: start={start}, end={end}, uzunluk={end - start + 1} frame")
+    if not rallies:
+        print("Ralli bulunamadı, ROI tespiti yapmıyorum.")
+        return
 
+    # 2) Masa ROI'sini tespit etmek için bir örnek frame seç
+    #    1. rallinin ortasındaki frame'i alıyorum:
+    first_start, first_end = rallies[0]
+    sample_idx = (first_start + first_end) // 2
+
+    frame = get_frame_at(args.video, sample_idx)
+    roi, _ = detect_table_roi(frame, margin=8)
+
+    ox, oy, ow, oh = roi["outer"]
+    ix, iy, iw, ih = roi["inner"]
+    bands = roi["bands"]
+
+    print("\n--- Masa ROI Bilgileri ---")
+    print(f"Dış (kumaş) dikdörtgen: x={ox}, y={oy}, w={ow}, h={oh}")
+    print(f"İç (oyun alanı) dikdörtgen: x={ix}, y={iy}, w={iw}, h={ih}")
+    print("Band sınırları:")
+    print(f"  left   = {bands['left']}")
+    print(f"  right  = {bands['right']}")
+    print(f"  top    = {bands['top']}")
+    print(f"  bottom = {bands['bottom']}")
+
+    # 3) Debug: ROI'yi çizip göster
+    visualize_table_roi(args.video, sample_idx, roi)
 
 if __name__ == "__main__":
     main()
