@@ -236,6 +236,146 @@ def parse_args():
     parser.add_argument("--debug-n",type=int,default=0)
     return parser.parse_args()
 
+def detect_balls_in_frame(frame, roi):
+    """
+    Masa ROI'si içinde kırmızı, sarı ve beyaz topları HSV tabanlı olarak tespit eder.
+    Dönüş:
+        balls = {
+            "red":    {"center": (x, y), "radius": r}  veya None,
+            "yellow": {"center": (x, y), "radius": r}  veya None,
+            "white":  {"center": (x, y), "radius": r}  veya None,
+        }
+    Koordinatlar full-frame piksel koordinatlarıdır.
+    """
+
+    ix, iy, iw, ih = roi["inner"]
+    table_crop = frame[iy:iy+ih, ix:ix+iw].copy()
+
+    hsv = cv2.cvtColor(table_crop, cv2.COLOR_BGR2HSV)
+
+    balls = {
+        "red": None,
+        "yellow": None,
+        "white": None,
+    }
+
+    def find_largest_contour(mask):
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            return None, None, None  # cx, cy, radius
+        cnt = max(contours, key=cv2.contourArea)
+        area = cv2.contourArea(cnt)
+        if area <= 0:
+            return None, None, None
+        (x, y), radius = cv2.minEnclosingCircle(cnt)
+        return x, y, radius
+
+    # --- KIRMIZI TOP (H ~ 160–180, S ve V yüksek) ---
+    lower_red1 = np.array([0, 120, 120], dtype=np.uint8)
+    upper_red1 = np.array([10, 255, 255], dtype=np.uint8)
+    lower_red2 = np.array([160, 120, 120], dtype=np.uint8)
+    upper_red2 = np.array([180, 255, 255], dtype=np.uint8)
+
+    mask_r1 = cv2.inRange(hsv, lower_red1, upper_red1)
+    mask_r2 = cv2.inRange(hsv, lower_red2, upper_red2)
+    mask_red = cv2.bitwise_or(mask_r1, mask_r2)
+
+    kernel = np.ones((3, 3), np.uint8)
+    mask_red = cv2.morphologyEx(mask_red, cv2.MORPH_OPEN, kernel, iterations=1)
+    mask_red = cv2.morphologyEx(mask_red, cv2.MORPH_CLOSE, kernel, iterations=2)
+
+    rx, ry, rr = find_largest_contour(mask_red)
+    if rx is not None:
+        balls["red"] = {
+            "center": (int(ix + rx), int(iy + ry)),
+            "radius": float(rr),
+        }
+
+    # --- SARI TOP (H ~ 18–24, S ve V yüksek) ---
+    lower_yellow = np.array([15, 150, 150], dtype=np.uint8)
+    upper_yellow = np.array([30, 255, 255], dtype=np.uint8)
+
+    mask_y = cv2.inRange(hsv, lower_yellow, upper_yellow)
+    mask_y = cv2.morphologyEx(mask_y, cv2.MORPH_OPEN, kernel, iterations=1)
+    mask_y = cv2.morphologyEx(mask_y, cv2.MORPH_CLOSE, kernel, iterations=2)
+
+    yx, yy, yr = find_largest_contour(mask_y)
+    if yx is not None:
+        balls["yellow"] = {
+            "center": (int(ix + yx), int(iy + yy)),
+            "radius": float(yr),
+        }
+    # --- BEYAZ TOP ---
+    # Mantık: düşük S, çok yüksek V, küçük-orta boy parlak dairesel bölge.
+    # H aralığını serbest bırakıyoruz.
+    lower_white = np.array([0, 0, 210], dtype=np.uint8)
+    upper_white = np.array([180, 80, 255], dtype=np.uint8)
+
+    mask_w = cv2.inRange(hsv, lower_white, upper_white)
+    mask_w = cv2.morphologyEx(mask_w, cv2.MORPH_OPEN, kernel, iterations=1)
+    mask_w = cv2.morphologyEx(mask_w, cv2.MORPH_CLOSE, kernel, iterations=2)
+
+    contours, _ = cv2.findContours(mask_w, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    cand_center = None
+    cand_radius = None
+    max_area = 0.0
+
+    for cnt in contours:
+        (x, y), radius = cv2.minEnclosingCircle(cnt)
+        area = cv2.contourArea(cnt)
+
+        # Top boyutuna göre kaba filtre (bu videoda ~8-9 px civarı)
+        if 5 < radius < 20 and area > max_area:
+            max_area = area
+            cand_center = (x, y)
+            cand_radius = radius
+
+    if cand_center is not None:
+        wx, wy = cand_center
+        balls["white"] = {
+            "center": (int(ix + wx), int(iy + wy)),
+            "radius": float(cand_radius),
+        }
+
+
+    return balls
+
+def visualize_balls_on_frame(frame, roi, balls):
+    vis = frame.copy()
+
+    # Masa iç ROI'yi hafifçe çizelim (debug için)
+    ix, iy, iw, ih = roi["inner"]
+    cv2.rectangle(vis, (ix, iy), (ix + iw, iy + ih), (0, 255, 0), 1)
+
+    colors_bgr = {
+        "red":    (0, 0, 255),
+        "yellow": (0, 255, 255),
+        "white":  (255, 255, 255),
+    }
+
+    for name, info in balls.items():
+        if info is None:
+            continue
+        cx, cy = info["center"]
+        r = int(info["radius"])
+        cv2.circle(vis, (cx, cy), r, colors_bgr[name], 2)
+        cv2.circle(vis, (cx, cy), 2, (0, 0, 0), -1)
+        cv2.putText(
+            vis,
+            name,
+            (cx + 5, cy - 5),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            colors_bgr[name],
+            1,
+            cv2.LINE_AA,
+        )
+
+    cv2.imshow("Ball detection debug", vis)
+    print("Top tespiti görüntülendi. Kapatmak için bir tuşa bas.")
+    cv2.waitKey(0)
+    cv2.destroyAllWindows()
+
 
 def main():
     args = parse_args()
@@ -277,8 +417,15 @@ def main():
     print(f"  top    = {bands['top']}")
     print(f"  bottom = {bands['bottom']}")
 
-    # 3) Debug: ROI'yi çizip göster
-    visualize_table_roi(args.video, sample_idx, roi)
+    # 3) Aynı framede topları tespit et
+    balls = detect_balls_in_frame(frame, roi)
+
+    print("\n--- Top bilgileri (örnek frame) ---")
+    for name, info in balls.items():
+        print(f"{name}: {info}")
+
+    # 4) Debug: topları çiz ve göster
+    visualize_balls_on_frame(frame, roi, balls)
 
 if __name__ == "__main__":
     main()
