@@ -1,268 +1,165 @@
 import cv2
 import numpy as np
+import argparse
+import os
 
-INPUT_VIDEO  = "input.mp4"
-OUTPUT_VIDEO = ""   # İstersen boş bırakıp kaydedebilirsin
 
-def order_points(pts):
+def is_separator_frame_template(frame, template_gray, match_threshold=0.8, debug=False) -> bool:
     """
-    pts: (N,2) noktalar. Çıktı sırası: tl, tr, br, bl
+    Ayrı verilen separator görseline (template) göre frame'in separator olup
+    olmadığını tespit eder.
+    - Template ve frame gri formda eşleştiriliyor.
+    - Template frame'den büyükse, frame'e sığacak şekilde ölçekleniyor.
     """
-    pts = np.array(pts, dtype="float32")
 
-    # y'ye göre sırala (küçük y = üst)
-    idx_by_y = np.argsort(pts[:, 1])
-    pts_sorted = pts[idx_by_y]
+    frame_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-    top = pts_sorted[:2]
-    bottom = pts_sorted[2:]
+    fh, fw = frame_gray.shape
+    th, tw = template_gray.shape
 
-    # üsttekileri x'e göre sırala -> tl, tr
-    top = top[np.argsort(top[:, 0])]
-    tl, tr = top
+    # Template frame'den büyükse biraz küçült
+    tpl = template_gray
+    if th > fh or tw > fw:
+        scale = min(fh / th, fw / tw) * 0.9
+        new_size = (max(1, int(tw * scale)), max(1, int(th * scale)))
+        tpl = cv2.resize(template_gray, new_size)
+        th, tw = tpl.shape
 
-    # alttakileri x'e göre sırala -> bl, br
-    bottom = bottom[np.argsort(bottom[:, 0])]
-    bl, br = bottom
+    # Template matching
+    res = cv2.matchTemplate(frame_gray, tpl, cv2.TM_CCOEFF_NORMED)
+    score = res.max()
 
-    return np.array([tl, tr, br, bl], dtype="float32")
+    if debug:
+        print(f"[DEBUG] template_match_score = {score:.3f}")
 
-def detect_table(frame):
-    """İlk frame üzerinde MAVİ masayı tespit eder, 4 köşe döner."""
-    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    return score >= match_threshold
 
-    # Mavi/turkuaz bilardo masası için HSV aralığı
-    lower_blue = np.array([90, 40, 40])
-    upper_blue = np.array([140, 255, 255])
 
-    mask = cv2.inRange(hsv, lower_blue, upper_blue)
+def find_rallies(
+        video_path: str,
+        template_path: str,
+        match_threshold: float = 0.8,
+        expand_frames: int = 29,
+        min_rally_length: int = 80,
+        debug_every_n: int = 0
+):
+    # Separator görselini yükle
+    if not os.path.exists(template_path):
+        raise FileNotFoundError(f"Separator template bulunamadı: {template_path}")
 
-    kernel = np.ones((7, 7), np.uint8)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=2)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+    template_bgr = cv2.imread(template_path)
+    if template_bgr is None:
+        raise RuntimeError(f"Separator template okunamadı: {template_path}")
 
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL,
-                                   cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
-        print("Masa konturu bulunamadı.")
-        return None
+    template_gray = cv2.cvtColor(template_bgr, cv2.COLOR_BGR2GRAY)
 
-    table_contour = max(contours, key=cv2.contourArea)
-
-    epsilon = 0.02 * cv2.arcLength(table_contour, True)
-    approx = cv2.approxPolyDP(table_contour, epsilon, True)
-
-    if len(approx) < 4:
-        rect = cv2.minAreaRect(table_contour)
-        box = cv2.boxPoints(rect)
-        approx = np.int0(box)
-
-    pts = approx.reshape(-1, 2)
-
-    if pts.shape[0] > 4:
-        hull = cv2.convexHull(pts)
-        if hull.shape[0] >= 4:
-            pts = hull.reshape(-1, 2)
-        pts = pts[:4]
-
-    if pts.shape[0] != 4:
-        print("4 köşe bulunamadı, masayı dikdörtgen gibi modelleyemedik.")
-        return None
-
-    ordered = order_points(pts)
-    print("[DEBUG] Masa köşeleri (tl, tr, br, bl):")
-    print(ordered)
-    return ordered
-
-def compute_perspective_transform(table_corners):
-    """
-    Masa köşelerinden homografi matrisi ve çıktı boyutlarını hesaplar.
-    table_corners: (4,2) float32, sırası: tl, tr, br, bl
-    """
-    (tl, tr, br, bl) = table_corners
-
-    widthA = np.linalg.norm(br - bl)
-    widthB = np.linalg.norm(tr - tl)
-    maxWidth = int(max(widthA, widthB))
-
-    heightA = np.linalg.norm(tr - br)
-    heightB = np.linalg.norm(tl - bl)
-    maxHeight = int(max(heightA, heightB))
-
-    if maxWidth < 10 or maxHeight < 10:
-        print(f"[WARN] Hesaplanan masa boyutları çok küçük: {maxWidth}x{maxHeight}")
-        return None, None, None
-
-    print(f"[DEBUG] Warp size: {maxWidth} x {maxHeight}")
-
-    dst = np.array([
-        [0, 0],
-        [maxWidth - 1, 0],
-        [maxWidth - 1, maxHeight - 1],
-        [0, maxHeight - 1]
-    ], dtype="float32")
-
-    M = cv2.getPerspectiveTransform(table_corners, dst)
-    return M, maxWidth, maxHeight
-
-def detect_white_ball(warped, prev_center=None):
-    """
-    warped masa görüntüsünde beyaz topu tespit etmeye çalışır.
-    Dönen: (cx, cy, r) veya None
-    """
-    hsv = cv2.cvtColor(warped, cv2.COLOR_BGR2HSV)
-
-    # Beyaz için yaklaşık aralık: düşük S, yüksek V
-    # Bunlarla oynaman gerekebilir (ışığa göre)
-    lower_white = np.array([0,   0, 200])
-    upper_white = np.array([180, 60, 255])
-
-    mask = cv2.inRange(hsv, lower_white, upper_white)
-
-    # Gürültü temizliği
-    kernel = np.ones((3, 3), np.uint8)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
-
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL,
-                                   cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
-        return None
-
-    best_candidate = None
-    best_score = -1
-
-    for cnt in contours:
-        area = cv2.contourArea(cnt)
-        if area < 20 or area > 1000:
-            continue  # çok küçük / çok büyük gürültüleri at
-
-        perimeter = cv2.arcLength(cnt, True)
-        if perimeter == 0:
-            continue
-
-        circularity = 4 * np.pi * area / (perimeter * perimeter)
-
-        # Daireye yakınlık filtresi
-        if circularity < 0.6:
-            continue
-
-        (x, y), radius = cv2.minEnclosingCircle(cnt)
-        center = (int(x), int(y))
-
-        # Eğer önceki frame'de bir merkez varsa, ona yakın olanı tercih et
-        score = circularity
-        if prev_center is not None:
-            dist = np.linalg.norm(np.array(center) - np.array(prev_center))
-            score = circularity - 0.001 * dist  # biraz uzaklık penalizesi
-
-        if score > best_score:
-            best_score = score
-            best_candidate = (center, radius)
-
-    if best_candidate is None:
-        return None
-
-    (center, radius) = best_candidate
-    return (center[0], center[1], radius)
-
-def warp_to_original(M_inv, x_w, y_w):
-    """Warped koordinatını homografinin tersiyle orijinal frame'e map eder."""
-    pt = np.array([x_w, y_w, 1.0], dtype=np.float32).reshape(3, 1)
-    dst = M_inv @ pt
-    dst /= dst[2, 0]  # homojen normalize
-    return int(dst[0, 0]), int(dst[1, 0])
-
-def main():
-    cap = cv2.VideoCapture(INPUT_VIDEO)
+    cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
-        print("Video açılamadı:", INPUT_VIDEO)
-        return
+        raise RuntimeError(f"Video açılamadı: {video_path}")
 
-    # İlk frame: masayı tespit etmek için
-    ret, first_frame = cap.read()
-    if not ret:
-        print("İlk frame okunamadı.")
-        cap.release()
-        return
-
-    table_corners = detect_table(first_frame)
-    if table_corners is None:
-        print("Bilardo masası tespit edilemedi, video işaretlenmeyecek.")
-        cap.release()
-        return
-
-    # Homografi ve çıktı boyutları
-    M, warp_w, warp_h = compute_perspective_transform(table_corners)
-    if M is None:
-        print("Homografi hesaplanamadı, perspektif düzeltme iptal.")
-        cap.release()
-        return
-
-    M_inv = np.linalg.inv(M)
-
-    # Video özellikleri
-    fps    = cap.get(cv2.CAP_PROP_FPS)
-    width  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-
-    writer = None
-    if OUTPUT_VIDEO:
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        writer = cv2.VideoWriter(OUTPUT_VIDEO, fourcc, fps, (width, height))
-
-    # Videoyu başa sar
-    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-
-    table_corners_int = table_corners.astype(int)
-    prev_center_warp = None  # önceki frame'deki top merkezi (warped)
+    frame_idx = 0
+    core_sep_flags = []  # her frame için: core separator mı? (template direkt eşleşen frame)
+    core_sep_indices = []
 
     while True:
         ret, frame = cap.read()
         if not ret:
             break
 
-        # 1) Orijinal masayı işaretle
-        cv2.polylines(frame, [table_corners_int], isClosed=True,
-                      color=(0, 0, 255), thickness=3)
-        for (x, y) in table_corners_int:
-            cv2.circle(frame, (x, y), 4, (255, 0, 0), -1)
+        debug = (debug_every_n > 0 and frame_idx % debug_every_n == 0)
 
-        # 2) Tepeden görünüm
-        warped = cv2.warpPerspective(frame, M, (warp_w, warp_h))
+        is_core_sep = is_separator_frame_template(
+            frame,
+            template_gray,
+            match_threshold=match_threshold,
+            debug=debug
+        )
 
-        # 3) Warped üzerinde beyaz topu ara
-        ball = detect_white_ball(warped, prev_center=prev_center_warp)
-        if ball is not None:
-            cx_w, cy_w, r_w = ball
-            prev_center_warp = (cx_w, cy_w)
+        core_sep_flags.append(is_core_sep)
+        if is_core_sep:
+            core_sep_indices.append(frame_idx)
 
-            # Warped görüntüde çiz
-            cv2.circle(warped, (cx_w, cy_w), int(r_w), (0, 0, 255), 2)
-            cv2.circle(warped, (cx_w, cy_w), 3, (0, 255, 0), -1)
+        frame_idx += 1
 
-            # Orijinale geri projeksiyon
-            x_o, y_o = warp_to_original(M_inv, cx_w, cy_w)
-            cv2.circle(frame, (x_o, y_o), 10, (0, 255, 255), 2)
-            cv2.circle(frame, (x_o, y_o), 4, (0, 255, 255), -1)
-
-        # Göster
-        cv2.imshow("Orijinal (Masa + Top Takibi)", frame)
-        cv2.imshow("Masa Tepeden (Warped + Top)", warped)
-
-        if writer is not None:
-            writer.write(frame)
-
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
-
+    total_frames = frame_idx
     cap.release()
-    if writer is not None:
-        writer.release()
-    cv2.destroyAllWindows()
 
-    if writer is not None:
-        print("Isaretlenmis video kaydedildi ->", OUTPUT_VIDEO)
+    if not core_sep_indices:
+        print("Uyarı: Hiç core separator frame bulunamadı.")
+        # Yine de tüm videoyu tek ralli olarak döndürelim
+        return [(0, total_frames - 1)], [], total_frames
+
+    # 1D "genişletme": Template görünen framelerin etrafındaki ±expand_frames
+    # aralığı da separator kabul ediliyor. Böylece animasyon + beyaz geçişler
+    # aynı separator bloğuna dahil olmuş oluyor.
+    is_sep = [False] * total_frames
+    for i, flag in enumerate(core_sep_flags):
+        if flag:
+            start = max(0, i - expand_frames)
+            end = min(total_frames - 1, i)
+            for j in range(start, end + 1):
+                is_sep[j] = True
+
+    # Debug için: final separator framelerini listlemek istersek
+    final_sep_indices = [i for i, f in enumerate(is_sep) if f]
+
+    # Şimdi separator blokları arasındaki aralıkları ralli olarak çıkaralım
+    rallies = []
+    in_rally = False
+    rally_start = 0
+
+    for i in range(total_frames):
+        if not is_sep[i]:  # oyun frameleri
+            if not in_rally:
+                in_rally = True
+                rally_start = i
+        else:  # separator frameleri
+            if in_rally:
+                in_rally = False
+                rally_end = i - 1
+                length = rally_end - rally_start + 1
+                if length >= min_rally_length:
+                    rallies.append((rally_start, rally_end))
+        # separator ise ralli otomatik kapanmış olur
+
+    # video separator ile bitmediyse son ralliyi kapat
+    if in_rally:
+        rally_end = total_frames - 1
+        length = rally_end - rally_start + 1
+        if length >= min_rally_length:
+            rallies.append((rally_start, rally_end))
+
+    return rallies, final_sep_indices, total_frames
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="3 top bilardo videosunda ralli sınırlarını separator template'ine göre bulur."
+    )
+    parser.add_argument("video")
+    parser.add_argument("--template",default="frame_000000.jpg")
+    parser.add_argument("--match-threshold",type=float,default=0.8)
+    parser.add_argument("--expand-frames",type=int,default=29)
+    parser.add_argument("--min-rally-length",type=int,default=90)
+    parser.add_argument("--debug-n",type=int,default=0)
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+
+    rallies, sep_indices, total_frames = find_rallies(
+        args.video,
+        args.template,
+        match_threshold=args.match_threshold,
+        expand_frames=args.expand_frames,
+        debug_every_n=args.debug_n
+    )
+    print(f"Bulunan ralli sayısı: {len(rallies)}")
+
+    for i, (start, end) in enumerate(rallies, start=1):
+        print(f"Ralli {i}: start={start}, end={end}, uzunluk={end - start + 1} frame")
+
 
 if __name__ == "__main__":
     main()
