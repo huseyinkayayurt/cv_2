@@ -743,33 +743,7 @@ def track_balls_for_rally(video_path, roi, rally_start, rally_end):
     cap.release()
     positions = interpolate_ball_tracks(positions, max_gap=3)
 
-    debug_white_yellow_rally5(positions, start_f=1481, end_f=1749)
     return positions
-
-
-def debug_white_yellow_rally5(ball_positions, start_f=1481, end_f=1749):
-    print("\n=== DEBUG: Ralli 5 için white–yellow mesafe analizi ===")
-    white_track = ball_positions.get("white", {})
-    yellow_track = ball_positions.get("yellow", {})
-
-    for f in range(start_f, end_f + 1):
-        p_w = white_track.get(f, None)
-        p_y = yellow_track.get(f, None)
-
-        if p_w is None and p_y is None:
-            print(f"frame {f}: white=YOK, yellow=YOK")
-            continue
-        if p_w is None:
-            print(f"frame {f}: white=YOK, yellow={p_y}")
-            continue
-        if p_y is None:
-            print(f"frame {f}: white={p_w}, yellow=YOK")
-            continue
-
-        xw, yw, _ = p_w
-        xy, yy, _ = p_y
-        d = float(np.hypot(xw - xy, yw - yy))
-        print(f"frame {f}: white=({xw:.1f},{yw:.1f}), yellow=({xy:.1f},{yy:.1f}), dist={d:.2f}")
 
 
 def interpolate_ball_tracks(ball_positions, max_gap=3):
@@ -1187,6 +1161,9 @@ def main():
     # )
 
     print("\n=== Tüm ralliler için özet analiz ===")
+    total_rallies = len(rallies)
+    success_count = 0
+    total_bands_sum = 0
     for i, (start, end) in enumerate(rallies, start=1):
         result = analyze_rally(args.video, roi, start, end, debug=False)
 
@@ -1210,6 +1187,25 @@ def main():
         print(f"  KIRMIZI'ya çarptı mı? {hit_red}")
         print(f"  SARI'ya çarptı mı?   {hit_yellow}")
         print(f"  -> Bu ralli {'BAŞARILI' if success else 'BAŞARISIZ'}")
+
+        # --- yeni ek: istatistik toplama ---
+        total_bands_sum += total_bands
+        if success:
+            success_count += 1
+
+    # --- Genel özet ---
+    if total_rallies > 0:
+        avg_bands = total_bands_sum / float(total_rallies)
+        success_rate = 100.0 * success_count / float(total_rallies)
+    else:
+        avg_bands = 0.0
+        success_rate = 0.0
+
+    print("\n=== GENEL SONUÇLAR ===")
+    print(f"Toplam ralli sayısı : {total_rallies}")
+    print(f"Başarılı ralli sayısı: {success_count}")
+    print(f"Başarı oranı        : %{success_rate:.1f}")
+    print(f"Ortalama band sayısı: {avg_bands:.2f}")
 
 
 if __name__ == "__main__":
