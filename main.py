@@ -132,7 +132,7 @@ def find_rallies(
     return rallies, final_sep_indices, total_frames
 
 
-def detect_table_roi(frame, margin: int = 8):
+def detect_table_roi(frame, margin: int = 8, band_inset: int = 12):
     """
     Bilardo masasının oyun alanını (turkuaz kumaş kısmı) otomatik tespit eder.
     Dönen:
@@ -177,18 +177,25 @@ def detect_table_roi(frame, margin: int = 8):
     iw = max(1, w - 2 * margin)
     ih = max(1, h - 2 * margin)
 
+    # Band çizgilerini içeri doğru biraz daha çekiyoruz
+    bx = ix + band_inset
+    by = iy + band_inset
+    bw = max(1, iw - 2 * band_inset)
+    bh = max(1, ih - 2 * band_inset)
+
     roi = {
         "outer": (x, y, w, h),
         "inner": (ix, iy, iw, ih),
         "bands": {
-            "left": ix,
-            "right": ix + iw - 1,
-            "top": iy,
-            "bottom": iy + ih - 1,
+            "left": bx,
+            "right": bx + bw - 1,
+            "top": by,
+            "bottom": by + bh - 1,
         },
     }
 
     return roi, mask
+
 
 def get_frame_at(video_path: str, frame_idx: int):
     """Belirli indexteki frame'i okur."""
@@ -224,17 +231,19 @@ def visualize_table_roi(video_path: str, sample_idx: int, roi):
     cv2.waitKey(0)
     cv2.destroyAllWindows()
 
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description="3 top bilardo videosunda ralli sınırlarını separator template'ine göre bulur."
     )
     parser.add_argument("video")
-    parser.add_argument("--template",default="frame_000000.jpg")
-    parser.add_argument("--match-threshold",type=float,default=0.8)
-    parser.add_argument("--expand-frames",type=int,default=29)
-    parser.add_argument("--min-rally-length",type=int,default=90)
-    parser.add_argument("--debug-n",type=int,default=0)
+    parser.add_argument("--template", default="frame_000000.jpg")
+    parser.add_argument("--match-threshold", type=float, default=0.8)
+    parser.add_argument("--expand-frames", type=int, default=29)
+    parser.add_argument("--min-rally-length", type=int, default=90)
+    parser.add_argument("--debug-n", type=int, default=0)
     return parser.parse_args()
+
 
 def detect_balls_in_frame(frame, roi):
     """
@@ -249,7 +258,7 @@ def detect_balls_in_frame(frame, roi):
     """
 
     ix, iy, iw, ih = roi["inner"]
-    table_crop = frame[iy:iy+ih, ix:ix+iw].copy()
+    table_crop = frame[iy:iy + ih, ix:ix + iw].copy()
 
     hsv = cv2.cvtColor(table_crop, cv2.COLOR_BGR2HSV)
 
@@ -337,8 +346,8 @@ def detect_balls_in_frame(frame, roi):
             "radius": float(cand_radius),
         }
 
-
     return balls
+
 
 def visualize_balls_on_frame(frame, roi, balls):
     vis = frame.copy()
@@ -348,9 +357,9 @@ def visualize_balls_on_frame(frame, roi, balls):
     cv2.rectangle(vis, (ix, iy), (ix + iw, iy + ih), (0, 255, 0), 1)
 
     colors_bgr = {
-        "red":    (0, 0, 255),
+        "red": (0, 0, 255),
         "yellow": (0, 255, 255),
-        "white":  (255, 255, 255),
+        "white": (255, 255, 255),
     }
 
     for name, info in balls.items():
@@ -374,6 +383,289 @@ def visualize_balls_on_frame(frame, roi, balls):
     cv2.imshow("Ball detection debug", vis)
     print("Top tespiti görüntülendi. Kapatmak için bir tuşa bas.")
     cv2.waitKey(0)
+    cv2.destroyAllWindows()
+
+
+def process_rally_white_and_bands(video_path, roi, rally_start, rally_end,
+                                  initial_white=None, debug=False):
+    """
+    Verilen ralli aralığında beyaz topu takip eder, her frame için merkezini hesaplar,
+    sonra band mesafelerine threshold + "uzaktan gelme" mantığıyla bakarak
+    kaç banda kaç kere ve hangi sırayla çarptığını bulur.
+
+    Dönen:
+        band_counts:  { 'left': n, 'right': n, 'top': n, 'bottom': n }
+        positions:    { frame_idx: (cx, cy, r) }
+        hit_sequence: [ ('bottom', frame_idx), ('left', frame_idx), ... ]
+    """
+
+    bands = roi["bands"]
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise RuntimeError(f"Video açılamadı: {video_path}")
+
+    cap.set(cv2.CAP_PROP_POS_FRAMES, rally_start)
+
+    prev_center = None
+    prev_radius = 8.0
+    if initial_white is not None:
+        prev_center = initial_white["center"]
+        prev_radius = initial_white["radius"]
+
+    positions = {}
+
+    # 1) Önce tüm ralliyi bir kere geçip beyaz top merkezlerini çıkaralım
+    for idx in range(rally_start, rally_end + 1):
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        balls = detect_balls_in_frame(frame, roi)
+        info = balls["white"]
+
+        if info is not None:
+            cx, cy = info["center"]
+            r = info["radius"]
+            prev_center = (cx, cy)
+            prev_radius = r
+        elif prev_center is not None:
+            cx, cy = prev_center
+            r = prev_radius
+        else:
+            # henüz hiç beyaz top görmediysek bu frame'i es geçiyoruz
+            continue
+
+        positions[idx] = (cx, cy, r)
+
+    cap.release()
+
+    if not positions:
+        # Hiç beyaz top tespit edilemediyse
+        return {s: 0 for s in ["left", "right", "top", "bottom"]}, {}, []
+
+    # 2) Her band için distance zaman serisini çıkaralım
+    frames_sorted = sorted(positions.keys())
+    distances_per_side = {side: [] for side in ["left", "right", "top", "bottom"]}
+
+    for f in frames_sorted:
+        cx, cy, r = positions[f]
+
+        dist_left = cx - bands["left"]
+        dist_right = bands["right"] - cx
+        dist_top = cy - bands["top"]
+        dist_bottom = bands["bottom"] - cy
+
+        distances_per_side["left"].append((f, float(max(dist_left, 0.0))))
+        distances_per_side["right"].append((f, float(max(dist_right, 0.0))))
+        distances_per_side["top"].append((f, float(max(dist_top, 0.0))))
+        distances_per_side["bottom"].append((f, float(max(dist_bottom, 0.0))))
+
+    # 3) Threshold + "uzaktan gelme" + hysteresis ile hit tespit
+
+    band_counts = {side: 0 for side in distances_per_side}
+    hit_sequence = []
+
+    BALL_R = 10.0
+
+    # Yaklaşma/uzaklaşma eşikleri
+    ENTER_TH = BALL_R + 3.0  # mesafe buranın altına inince "banda çok yakın" say
+    EXIT_TH = BALL_R + 7.0  # mesafe buranın üstüne çıkınca tekrar "far" moda dön
+    APPROACH_DELTA = 6.0  # uzaktan gelmiş saymak için: prev_far_dist - cur_dist >= bu
+    MIN_FRAME_GAP = 10  # aynı banda iki hit arasında minimum frame
+    # İstersen bunlarla oynayabilirsin
+
+    for side, series in distances_per_side.items():
+        if len(series) < 2:
+            continue
+
+        state = "far"  # 'far' veya 'near'
+        last_far_dist = None  # 'far' durumundayken gördüğümüz en büyük mesafe
+        last_hit_frame = -99999
+
+        for f, d in series:
+            # Stabilite için negatifler sıfıra kırpıldı; burada d >= 0 olmalı
+            if state == "far":
+                # far durumundayken "ne kadar uzaktaydık" bilgisini topla
+                if last_far_dist is None or d > last_far_dist:
+                    last_far_dist = d
+
+                # Hit adayı: yeterince yakına girdik mi?
+                if d <= ENTER_TH and last_far_dist is not None:
+                    # Uzaktan gerçekten gelmiş mi?
+                    if (last_far_dist - d) >= APPROACH_DELTA and (f - last_hit_frame) >= MIN_FRAME_GAP:
+                        band_counts[side] += 1
+                        last_hit_frame = f
+                        state = "near"
+                        if debug:
+                            print(f"[DEBUG] HIT {side} at frame {f} (last_far={last_far_dist:.1f}, d={d:.1f})")
+                        hit_sequence.append((side, f))
+                        # near'a geçtikten sonra far mesafeyi sıfırla
+                        last_far_dist = None
+
+            else:  # state == 'near'
+                # Banda yakınken uzağa çıkmayı bekliyoruz
+                if d >= EXIT_TH:
+                    state = "far"
+                    last_far_dist = d  # yeni far başlangıç mesafesi
+
+    # frame sırasına göre sıralayalım
+    hit_sequence.sort(key=lambda x: x[1])
+
+    return band_counts, positions, hit_sequence
+
+
+def visualize_rally_hits(video_path, roi, rally_start, rally_end, positions, hit_sequence,
+                         window_name="Rally debug", play_delay=20):
+    """
+    Verilen ralli aralığını oynatır, beyaz topu ve band çizgilerini çizer,
+    process_rally_white_and_bands'ten gelen hit_sequence'e göre çarpmaları
+    video üzerinde gösterir.
+
+    hit_sequence: [('bottom', frame_idx), ('left', frame_idx), ...]
+    positions:    { frame_idx: (cx, cy, r) }
+
+    Her hit olduğu framede görüntüyü durdurur (waitKey(0)).
+    Normal framelerde play_delay ms bekler (ör: 20 ms).
+    """
+
+    bands = roi["bands"]
+
+    # Hit'leri frame -> [side1, side2, ...] map'ine dönüştürelim
+    hits_by_frame = {}
+    for side, f in hit_sequence:
+        hits_by_frame.setdefault(f, []).append(side)
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise RuntimeError(f"Video açılamadı: {video_path}")
+
+    # Ralli başlangıcına sar
+    cap.set(cv2.CAP_PROP_POS_FRAMES, rally_start)
+
+    # Band çizgilerini çizerken kullanacağımız renkler
+    # BGR formatı
+    band_colors = {
+        "left": (255, 0, 0),  # mavi
+        "right": (0, 0, 255),  # kırmızı
+        "top": (0, 255, 0),  # yeşil
+        "bottom": (0, 255, 255),  # sarı
+    }
+
+    while True:
+        current_pos = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
+        if current_pos > rally_end:
+            break
+
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        frame_idx = current_pos
+
+        vis = frame.copy()
+
+        # --- Masa iç oyun alanını hafifçe çiz (isteğe bağlı) ---
+        ix, iy, iw, ih = roi["inner"]
+        cv2.rectangle(vis, (ix, iy), (ix + iw, iy + ih), (0, 128, 0), 1)
+
+        # --- Band çizgilerini çiz ---
+        # Solda dikey çizgi
+        cv2.line(vis, (bands["left"], bands["top"]), (bands["left"], bands["bottom"]), band_colors["left"], 2)
+        # Sağda dikey çizgi
+        cv2.line(vis, (bands["right"], bands["top"]), (bands["right"], bands["bottom"]), band_colors["right"], 2)
+        # Üstte yatay çizgi
+        cv2.line(vis, (bands["left"], bands["top"]), (bands["right"], bands["top"]), band_colors["top"], 2)
+        # Altta yatay çizgi
+        cv2.line(vis, (bands["left"], bands["bottom"]), (bands["right"], bands["bottom"]), band_colors["bottom"], 2)
+
+        # --- Beyaz topu çiz ---
+        if frame_idx in positions:
+            cx, cy, r = positions[frame_idx]
+            cv2.circle(vis, (int(cx), int(cy)), int(r), (255, 255, 255), 2)
+            cv2.circle(vis, (int(cx), int(cy)), 2, (0, 0, 0), -1)
+
+        # --- Bu framede hit varsa highlight et ---
+        hits_now = hits_by_frame.get(frame_idx, [])
+        if hits_now:
+            # Hit olan taraflar için büyük, gözükür highlight
+            text_lines = []
+            for side in hits_now:
+                color = band_colors.get(side, (0, 0, 0))
+                text_lines.append(f"HIT: {side.upper()}")
+                # Band çizgisine yakın bir yere büyük daire çizelim
+                if side == "left":
+                    hx, hy = bands["left"] + 20, (bands["top"] + bands["bottom"]) // 2
+                elif side == "right":
+                    hx, hy = bands["right"] - 20, (bands["top"] + bands["bottom"]) // 2
+                elif side == "top":
+                    hx, hy = (bands["left"] + bands["right"]) // 2, bands["top"] + 20
+                else:  # bottom
+                    hx, hy = (bands["left"] + bands["right"]) // 2, bands["bottom"] - 20
+
+                cv2.circle(vis, (hx, hy), 25, color, 3)
+
+            # Ekranın üstüne yazı
+            y0 = 30
+            for line in text_lines:
+                cv2.putText(
+                    vis,
+                    line,
+                    (30, y0),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.8,
+                    (0, 0, 0),
+                    3,
+                    cv2.LINE_AA,
+                )
+                cv2.putText(
+                    vis,
+                    line,
+                    (30, y0),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.8,
+                    (255, 255, 255),
+                    1,
+                    cv2.LINE_AA,
+                )
+                y0 += 30
+
+            # Ayrıca frame indexini de gösterelim
+            cv2.putText(
+                vis,
+                f"frame {frame_idx}",
+                (30, y0 + 10),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (0, 0, 0),
+                3,
+                cv2.LINE_AA,
+            )
+            cv2.putText(
+                vis,
+                f"frame {frame_idx}",
+                (30, y0 + 10),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (0, 255, 255),
+                1,
+                cv2.LINE_AA,
+            )
+
+            cv2.imshow(window_name, vis)
+            print(f"[DEBUG VIS] frame {frame_idx}: hits={hits_now}")
+            # Çarptığı framede durdur, sen space/ herhangi tuş ile ilerlet
+            key = cv2.waitKey(0) & 0xFF
+            if key == 27:  # ESC ile çık
+                break
+        else:
+            # Normal frame, akış halinde göster
+            cv2.imshow(window_name, vis)
+            key = cv2.waitKey(play_delay) & 0xFF
+            if key == 27:  # ESC ile çık
+                break
+
+    cap.release()
     cv2.destroyAllWindows()
 
 
@@ -426,6 +718,56 @@ def main():
 
     # 4) Debug: topları çiz ve göster
     visualize_balls_on_frame(frame, roi, balls)
+
+    print("\n=== İlk 3 ralli için band çarpma analizi ===")
+    for ridx in range(3):
+        start, end = rallies[ridx]
+        band_counts, _, hit_sequence = process_rally_white_and_bands(
+            args.video,
+            roi,
+            start,
+            end,
+            initial_white=None,
+            debug=False  # istersen burayı True yapıp debug logları da görebilirsin
+        )
+        total_bands = sum(band_counts.values())
+
+        # Sıralamayı sadece band isimleri şeklinde yazalım:
+        hit_order = [side for (side, f) in hit_sequence]
+
+        print(f"Ralli {ridx + 1}: frame {start}-{end}")
+        print(f"  band_counts = {band_counts}, total = {total_bands}")
+        print(f"  hit order   = {hit_order}")
+
+    # --- DEBUG: 2. rallinin band hit'lerini video üzerinde göster ---
+    # Örneğin ikinci ralliyi inceleyelim:
+    ridx = 2  # 0: 1. ralli, 1: 2. ralli, 2: 3. ralli ...
+
+    start, end = rallies[ridx]
+    band_counts, positions, hit_sequence = process_rally_white_and_bands(
+        args.video,
+        roi,
+        start,
+        end,
+        initial_white=None,
+        debug=False  # istersen True yapıp konsolda log da görebilirsin
+    )
+
+    print(f"\n[DEBUG] Ralli {ridx + 1} için görsel band hit debug başlıyor...")
+    print(f"  band_counts = {band_counts}")
+    print(f"  hit_sequence = {hit_sequence}")
+
+    visualize_rally_hits(
+        args.video,
+        roi,
+        start,
+        end,
+        positions,
+        hit_sequence,
+        window_name=f"Rally {ridx + 1} debug",
+        play_delay=20  # normal akışta frameler arası bekleme (ms)
+    )
+
 
 if __name__ == "__main__":
     main()
