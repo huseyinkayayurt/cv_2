@@ -1056,9 +1056,162 @@ def analyze_rally(video_path, roi, rally_start, rally_end, debug=False):
         "hit_red": hit_red,
         "hit_yellow": hit_yellow,
         "success": success,
+        "ball_positions": ball_positions,
     }
 
     return result
+
+
+def playback_full_video_with_overlays(video_path, roi, rallies, rally_results,
+                                      window_name="Bilardo Analiz", play_delay=25):
+    """
+    Tüm videoyu tek seferde oynatır.
+    - Ralli içindeyken beyaz topun etrafına kırmızı dikdörtgen çizer.
+    - Her rallinin sonunda özet bilgilerin yazdığı ek bir frame gösterir ve
+      programı durdurur; kullanıcı bir tuşa bastığında devam eder.
+    """
+
+    # 1) Beyaz topun tüm rallilerdeki global frame -> (x,y,r) map'ini çıkar
+    white_tracks_global = {}
+    rally_end_to_idx = {}
+
+    for i, (start, end) in enumerate(rallies):
+        rally_end_to_idx[end] = i
+        ball_positions = rally_results[i]["ball_positions"]
+        white_track = ball_positions.get("white", {})
+        for f, triple in white_track.items():
+            white_tracks_global[f] = triple
+
+    # 2) Video baştan sona oynatılacak
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise RuntimeError(f"Video açılamadı: {video_path}")
+
+    frame_idx = 0
+    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+
+    # Masa ROI'nin iç dikdörtgenini de çizebiliriz (isteğe bağlı)
+    ix, iy, iw, ih = roi["inner"]
+
+    def make_summary_frame(base_frame, rally_index):
+        """Ralli sonunda gösterilecek özet frame'i üretir."""
+        result = rally_results[rally_index]
+        start, end = rallies[rally_index]
+
+        band_counts = result["band_counts"]
+        total_bands = sum(band_counts.values())
+        hit_red = result["hit_red"]
+        hit_yellow = result["hit_yellow"]
+        success = result["success"]
+
+        # Taban olarak son frame'in kopyasını al, üstüne yarı saydam siyah kutu + yazı bas
+        overlay = base_frame.copy()
+        summary = base_frame.copy()
+
+        # Yarı saydam dikdörtgen
+        cv2.rectangle(overlay, (50, 60), (w - 50, h - 60), (0, 0, 0), -1)
+        alpha = 0.7
+        cv2.addWeighted(overlay, alpha, summary, 1 - alpha, 0, summary)
+
+        lines = [
+            f"Ralli {rally_index + 1}  (frame {start}-{end})",
+            f"Toplam band sayisi: {total_bands}  "
+            f"(L={band_counts['left']}, R={band_counts['right']}, "
+            f"T={band_counts['top']}, B={band_counts['bottom']})",
+            f"Kirmiziya carpti mi? {'EVET' if hit_red else 'HAYIR'}",
+            f"Sariya carpti mi?   {'EVET' if hit_yellow else 'HAYIR'}",
+            f"Ralli sonucu: {'BASARILI' if success else 'BASARISIZ'}",
+            "",
+            "Devam etmek icin herhangi bir tusa basiniz (ESC = cikis).",
+        ]
+
+        y0 = 110
+        for line in lines:
+            cv2.putText(
+                summary,
+                line,
+                (80, y0),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.8,
+                (255, 255, 255),
+                2,
+                cv2.LINE_AA,
+            )
+            y0 += 40
+
+        return summary
+
+    current_rally_idx = 0
+    total_rallies = len(rallies)
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        vis = frame.copy()
+
+        # Masa iç alanı (isteğe bağlı)
+        cv2.rectangle(vis, (ix, iy), (ix + iw, iy + ih), (0, 255, 0), 1)
+
+        # Eğer bu frame herhangi bir rallinin içindeyse, beyaz topu dikdörtgenle göster
+        if frame_idx in white_tracks_global:
+            x, y, r = white_tracks_global[frame_idx]
+            pad = int(max(12, 2 * r))  # boyuta gore biraz padding
+            x1 = max(0, int(x - pad))
+            y1 = max(0, int(y - pad))
+            x2 = min(w - 1, int(x + pad))
+            y2 = min(h - 1, int(y + pad))
+            cv2.rectangle(vis, (x1, y1), (x2, y2), (0, 0, 255), 2)
+
+        cv2.putText(
+            vis,
+            f"frame {frame_idx}",
+            (20, 30),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (0, 0, 0),
+            3,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            vis,
+            f"frame {frame_idx}",
+            (20, 30),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (0, 255, 255),
+            1,
+            cv2.LINE_AA,
+        )
+
+        cv2.imshow(window_name, vis)
+        key = cv2.waitKey(play_delay) & 0xFF
+        if key == 27:  # ESC
+            break
+
+        # Bu frame bir rallinin SON frame'i mi?
+        if frame_idx in rally_end_to_idx:
+            r_idx = rally_end_to_idx[frame_idx]
+            summary_frame = make_summary_frame(vis, r_idx)
+            cv2.imshow(window_name, summary_frame)
+
+            # Burada program duruyor; dogruluk kontrolu bu esnada yapilacak
+            key = cv2.waitKey(0) & 0xFF
+            if key == 27:  # ESC ile tamamen cik
+                break
+
+            current_rally_idx = r_idx + 1
+            if current_rally_idx >= total_rallies:
+                # Son ralliden sonra da devam edip videonun kalanini oynatmak istersen
+                # burada bir sey yapmana gerek yok, dongu zaten devam edecek.
+                pass
+
+        frame_idx += 1
+
+    cap.release()
+    cv2.destroyAllWindows()
 
 
 def main():
@@ -1164,8 +1317,11 @@ def main():
     total_rallies = len(rallies)
     success_count = 0
     total_bands_sum = 0
+
+    rally_results = []
     for i, (start, end) in enumerate(rallies, start=1):
         result = analyze_rally(args.video, roi, start, end, debug=False)
+        rally_results.append(result)
 
         band_counts = result["band_counts"]
         band_hits = result["band_hits"]
@@ -1206,6 +1362,10 @@ def main():
     print(f"Başarılı ralli sayısı: {success_count}")
     print(f"Başarı oranı        : %{success_rate:.1f}")
     print(f"Ortalama band sayısı: {avg_bands:.2f}")
+
+    # --- TUM VIDEOYU OVERLAY ILE OYNAT ---
+    print("\nVideo oynatimi baslatiliyor. ESC ile cikabilirsiniz.")
+    playback_full_video_with_overlays(args.video, roi, rallies, rally_results)
 
 
 if __name__ == "__main__":
