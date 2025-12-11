@@ -738,13 +738,134 @@ def track_balls_for_rally(video_path, roi, rally_start, rally_end):
                 prev[name] = (cx, cy, r)
                 positions[name][idx] = (cx, cy, r)
             else:
-                # Bu framede görmediysek, önceki konum varsa onu kullan
-                if prev[name] is not None:
-                    positions[name][idx] = prev[name]
-                # Hiç görmediysek, bu framede kayıt yok (çarpışma hesaplamasında da yok sayılır)
+                pass
 
     cap.release()
+    positions = interpolate_ball_tracks(positions, max_gap=3)
+
+    debug_white_yellow_rally5(positions, start_f=1481, end_f=1749)
     return positions
+
+
+def debug_white_yellow_rally5(ball_positions, start_f=1481, end_f=1749):
+    print("\n=== DEBUG: Ralli 5 için white–yellow mesafe analizi ===")
+    white_track = ball_positions.get("white", {})
+    yellow_track = ball_positions.get("yellow", {})
+
+    for f in range(start_f, end_f + 1):
+        p_w = white_track.get(f, None)
+        p_y = yellow_track.get(f, None)
+
+        if p_w is None and p_y is None:
+            print(f"frame {f}: white=YOK, yellow=YOK")
+            continue
+        if p_w is None:
+            print(f"frame {f}: white=YOK, yellow={p_y}")
+            continue
+        if p_y is None:
+            print(f"frame {f}: white={p_w}, yellow=YOK")
+            continue
+
+        xw, yw, _ = p_w
+        xy, yy, _ = p_y
+        d = float(np.hypot(xw - xy, yw - yy))
+        print(f"frame {f}: white=({xw:.1f},{yw:.1f}), yellow=({xy:.1f},{yy:.1f}), dist={d:.2f}")
+
+
+def interpolate_ball_tracks(ball_positions, max_gap=3):
+    """
+    ball_positions: {
+        "white":  {frame: (x, y, r), ...},
+        "red":    {...},
+        "yellow": {...}
+    }
+
+    Her top için, ardışık tespitler arasında
+    1 < gap <= max_gap ise aradaki frameleri
+    lineer interpolasyonla doldurur.
+    """
+    new_tracks = {}
+
+    for name, track in ball_positions.items():
+        frames = sorted(track.keys())
+        if len(frames) < 2:
+            new_tracks[name] = dict(track)
+            continue
+
+        filled = dict(track)
+
+        for i in range(len(frames) - 1):
+            f1 = frames[i]
+            f2 = frames[i + 1]
+            gap = f2 - f1
+
+            # Sadece küçük boşlukları doldur
+            if 1 < gap <= max_gap:
+                x1, y1, r1 = track[f1]
+                x2, y2, r2 = track[f2]
+
+                for f in range(f1 + 1, f2):
+                    t = (f - f1) / float(gap)
+                    x = x1 + t * (x2 - x1)
+                    y = y1 + t * (y2 - y1)
+                    r = r1 + t * (r2 - r1)
+                    filled[f] = (x, y, r)
+
+        new_tracks[name] = filled
+
+    return new_tracks
+
+
+def detect_speed_jump_collisions_single(ball_pos,
+                                        start_frame,
+                                        end_frame,
+                                        pre_window=4,
+                                        max_pre_speed=1.0,
+                                        min_post_speed=8.0):
+    """
+    Tek topa bakarak (ör. 'yellow') ani hızlanma anlarını bulur.
+    Bu, bir yerden darbe aldığı (beyaz ya da kırmızı çarpması) anı temsil eder.
+
+    pre_window: kaç frame geriye bakıp 'önceki hız'ı ölçelim
+    max_pre_speed: bu pencerenin ortalama hızı bundan küçükse 'durgundu' say
+    min_post_speed: çarpışma anındaki hız bunun üstündeyse 'ani hızlanma' say
+    """
+    frames = sorted(f for f in ball_pos.keys()
+                    if start_frame <= f <= end_frame)
+    if len(frames) < pre_window + 2:
+        return []
+
+    # frame -> speed (px/frame)
+    speeds = {}
+    for i in range(1, len(frames)):
+        f1, f2 = frames[i - 1], frames[i]
+        x1, y1, _ = ball_pos[f1]
+        x2, y2, _ = ball_pos[f2]
+        d = float(np.hypot(x2 - x1, y2 - y1))
+        dt = max(1, f2 - f1)
+        speeds[f2] = d / dt
+
+    collision_frames = []
+
+    for i in range(pre_window, len(frames)):
+        f = frames[i]
+        post_speed = speeds.get(f, 0.0)
+
+        # Öncesindeki pre_window frame’in hız ortalamasına bakalım
+        prev_fs = frames[i - pre_window:i]
+        prev_speeds = [speeds.get(ff, 0.0) for ff in prev_fs if ff in speeds]
+        if not prev_speeds:
+            continue
+
+        pre_speed_avg = float(np.mean(prev_speeds))
+
+        # Durgun + ani hızlanma koşulu
+        if pre_speed_avg < max_pre_speed and post_speed >= min_post_speed:
+            collision_frames.append(f)
+            # İlk ani hızlanma bizim için yeterli, kırpıp çıkıyoruz
+            break
+
+    return collision_frames
 
 
 def detect_collisions_between(ball_positions, name1, name2,
@@ -888,6 +1009,21 @@ def detect_collisions_between(ball_positions, name1, name2,
             continue
         collisions.append(fc)
         last_collision_frame2 = fc
+
+    # ==== FALLBACK: mesafe-based method hiçbir şey bulamadıysa,
+    # target topun sadece kendi hızına bakarak ani hızlanma anını yakala ====
+    if not collisions:
+        fb = detect_speed_jump_collisions_single(
+            pos2,
+            start_frame=common_frames[0],
+            end_frame=common_frames[-1],
+            pre_window=4,
+            max_pre_speed=1.0,
+            min_post_speed=8.0
+        )
+        if fb:
+            # bir tane bile bulsak, bunu çarpışma olarak ekleyelim
+            collisions.extend(fb)
 
     return collisions
 
