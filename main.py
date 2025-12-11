@@ -124,7 +124,7 @@ def find_rallies(
 
     # video separator ile bitmediyse son ralliyi kapat
     if in_rally:
-        rally_end = total_frames - 1
+        rally_end = total_frames - 30
         length = rally_end - rally_start + 1
         if length >= min_rally_length:
             rallies.append((rally_start, rally_end))
@@ -751,9 +751,8 @@ def detect_collisions_between(ball_positions, name1, name2,
                               ball_radius=10.0,
                               dist_factor=2.2,
                               min_frame_gap=8,
-                              trend_eps=0.3,
                               move_window=5,
-                              move_thresh=2.0):
+                              move_thresh=1.5):
     """
     İki top (ör. white & red / yellow) arasındaki çarpışma anlarını tespit eder.
 
@@ -761,26 +760,19 @@ def detect_collisions_between(ball_positions, name1, name2,
 
     Mantık:
       1) Ortak framelerde iki top arasındaki mesafeyi hesapla.
-      2) Mesafe eşik altına inmiş, local minimum oluşmuş ve
-         iki çarpışma arasında min_frame_gap sağlanıyorsa -> ADAY çarpışma.
-      3) Aday frame etrafında (± move_window):
-           - name2'nin toplam yer değiştirmesine
-           - ve çarpışma SONRASI hızının, çarpışma ÖNCESİ hızına göre artışına
-         bak:
-           -> bu şartlardan en az biri sağlanıyorsa GERÇEK çarpışma kabul et.
-           -> aksi halde near miss say ve ele.
-
-    move_thresh  : pre/post ortalama pozisyonlar arası minimum yer değiştirme (px)
+      2) Mesafe eşik altına düştüğü contiguous bölümleri (episode) bul.
+         Her bölümdeki MIN mesafe frame'i bir ADAY çarpışma frame'i kabul edilir.
+      3) Aday frame etrafında (± move_window) name2'nin hareketine bak.
     """
 
     pos1 = ball_positions[name1]
     pos2 = ball_positions[name2]
 
     common_frames = sorted(set(pos1.keys()) & set(pos2.keys()))
-    if len(common_frames) < 3:
+    if len(common_frames) < 2:
         return []
 
-    # Mesafe serisini çıkar
+    # 1) Mesafe serisini çıkar
     series = []
     for f in common_frames:
         x1, y1, _ = pos1[f]
@@ -788,59 +780,55 @@ def detect_collisions_between(ball_positions, name1, name2,
         d = float(np.hypot(x1 - x2, y1 - y2))
         series.append((f, d))
 
-    COLLISION_TH = dist_factor * (2.0 * ball_radius)  # ~ 44 px (R=10 için)
+    # --- ÖNEMLİ: white–yellow için daha geniş eşik ---
+    base_th = dist_factor * (2.0 * ball_radius)  # ~44 px
+    if name1 == "white" and name2 == "yellow":
+        COLLISION_TH = 3.0 * (2.0 * ball_radius)  # ~60 px
+    else:
+        COLLISION_TH = base_th
 
+    # 2) Mesafe eşik altına düştüğü contiguous bölümleri bul
+    below_idx = [i for i, (_, d) in enumerate(series) if d <= COLLISION_TH]
     candidate_frames = []
     last_candidate_frame = -99999
 
-    # 1) Mesafe + local minimum ile ADAY çarpışma framelerini bul
-    for i in range(1, len(series) - 1):
-        f_prev, d_prev = series[i - 1]
-        f_cur, d_cur = series[i]
-        f_next, d_next = series[i + 1]
+    if below_idx:
+        start = below_idx[0]
+        current = [start]
 
-        # Mesafe eşik altına inmeli
-        if d_cur > COLLISION_TH:
-            continue
+        def add_segment(seg_indices):
+            nonlocal last_candidate_frame
+            if not seg_indices:
+                return
+            # Bu segmentteki en küçük mesafe frame'ini seç
+            best_i = seg_indices[0]
+            best_d = series[best_i][1]
+            for idx in seg_indices[1:]:
+                _, d = series[idx]
+                if d < best_d:
+                    best_d = d
+                    best_i = idx
+            f_candidate = series[best_i][0]
 
-        # Local minimum: önce azal, sonra art
-        if not (d_cur <= d_prev and d_cur <= d_next):
-            continue
+            if f_candidate - last_candidate_frame >= min_frame_gap:
+                candidate_frames.append(f_candidate)
+                last_candidate_frame = f_candidate
 
-        # Gerçek "yaklaşıp uzaklaşma" olsun (gürültü filtresi)
-        if (d_prev - d_cur) <= trend_eps:
-            continue
-        if (d_next - d_cur) <= trend_eps:
-            continue
+        for idx in below_idx[1:]:
+            if idx == current[-1] + 1:
+                current.append(idx)
+            else:
+                add_segment(current)
+                current = [idx]
+        add_segment(current)
 
-        # Aynı olayı iki kere sayma
-        if f_cur - last_candidate_frame < min_frame_gap:
-            continue
-
-        candidate_frames.append(f_cur)
-        last_candidate_frame = f_cur
-
-    # 2) Adaylar için, vurulan top gerçekten hareket etmiş mi kontrol et
+    # 3) Adayların etrafında vurulan top gerçekten çarpışma tepkisi vermiş mi kontrol et
     def ball_moved_around_frame(ball_pos, frame, window, disp_thresh):
-        """
-        frame-window .. frame-1 arası "pre" penceresi,
-        frame+1 .. frame+window arası "post" penceresi.
-
-        Hem:
-          - pre/post ortalama pozisyonlar arası yer değiştirme,
-          - pre/post ortalama hızlar
-        hesaplanır.
-
-        Aşağıdakilerden biri sağlanırsa True döner:
-          1) displacement >= disp_thresh
-          2) post_speed >= min_post_speed VE
-             post_speed - pre_speed >= speed_delta
-        """
         pre_frames = [f for f in ball_pos.keys() if frame - window <= f < frame]
         post_frames = [f for f in ball_pos.keys() if frame < f <= frame + window]
 
         if not pre_frames or not post_frames:
-            return False  # yeterli veri yoksa temkinli ol
+            return False
 
         pre_frames_sorted = sorted(pre_frames)
         post_frames_sorted = sorted(post_frames)
@@ -865,10 +853,9 @@ def detect_collisions_between(ball_positions, name1, name2,
                 x1, y1, _ = ball_pos[f1]
                 x2, y2, _ = ball_pos[f2]
                 d = float(np.hypot(x2 - x1, y2 - y1))
-                dt = max(1, f2 - f1)  # frame farkı
+                dt = max(1, f2 - f1)
                 dists.append(d)
                 times.append(dt)
-            # toplam mesafe / toplam zaman ~ ortalama hız (px/frame)
             return float(sum(dists) / sum(times))
 
         pre_x, pre_y = avg_pos(pre_frames_sorted)
@@ -878,35 +865,29 @@ def detect_collisions_between(ball_positions, name1, name2,
         pre_speed = avg_speed(pre_frames_sorted)
         post_speed = avg_speed(post_frames_sorted)
 
-        # Hız tabanlı parametreler (çok konservatif tutuyoruz)
-        speed_delta = 0.4  # çarpışmadan sonra en az bu kadar hız artışı
-        min_post_speed = 0.3  # post hız en az bu kadar olsun ki "gerçek hareket" diyelim
+        speed_delta = 0.15
+        min_post_speed = 0.15
 
-        # 1) Yer değiştirme yeterince büyükse direkt kabul
-        if displacement >= disp_thresh:
-            return True
+        if displacement < disp_thresh:
+            return False
+        if post_speed < min_post_speed:
+            return False
+        if (post_speed - pre_speed) < speed_delta:
+            return False
 
-        # 2) Yer değiştirme küçük ama hız bariz artmışsa yine kabul
-        if (post_speed >= min_post_speed) and ((post_speed - pre_speed) >= speed_delta):
-            return True
-
-        # Aksi durumda hareket yok / önemsiz
-        return False
+        return True
 
     collisions = []
-    last_collision_frame = -99999
+    last_collision_frame2 = -99999
 
     for fc in candidate_frames:
         moved = ball_moved_around_frame(pos2, fc, move_window, move_thresh)
         if not moved:
-            # Beyaz çok yaklaşmış ama vurulan top anlamlı hareket etmemiş -> near miss
             continue
-
-        if fc - last_collision_frame < min_frame_gap:
+        if fc - last_collision_frame2 < min_frame_gap:
             continue
-
         collisions.append(fc)
-        last_collision_frame = fc
+        last_collision_frame2 = fc
 
     return collisions
 
