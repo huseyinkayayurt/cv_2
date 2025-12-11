@@ -314,9 +314,9 @@ def detect_balls_in_frame(frame, roi):
             "center": (int(ix + yx), int(iy + yy)),
             "radius": float(yr),
         }
+
     # --- BEYAZ TOP ---
-    # Mantık: düşük S, çok yüksek V, küçük-orta boy parlak dairesel bölge.
-    # H aralığını serbest bırakıyoruz.
+    # Mantık: düşük S, yüksek V + "dairesel" kontur (istakayı elemek için)
     lower_white = np.array([0, 0, 210], dtype=np.uint8)
     upper_white = np.array([180, 80, 255], dtype=np.uint8)
 
@@ -325,17 +325,47 @@ def detect_balls_in_frame(frame, roi):
     mask_w = cv2.morphologyEx(mask_w, cv2.MORPH_CLOSE, kernel, iterations=2)
 
     contours, _ = cv2.findContours(mask_w, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
     cand_center = None
     cand_radius = None
-    max_area = 0.0
+    max_score = 0.0  # sadece alan değil, "top skoru"na göre seçeceğiz
 
     for cnt in contours:
-        (x, y), radius = cv2.minEnclosingCircle(cnt)
         area = cv2.contourArea(cnt)
+        if area < 30:  # çok küçük gürültüleri at
+            continue
 
-        # Top boyutuna göre kaba filtre (bu videoda ~8-9 px civarı)
-        if 5 < radius < 20 and area > max_area:
-            max_area = area
+        # Enclosing circle
+        (x, y), radius = cv2.minEnclosingCircle(cnt)
+
+        # Topun beklenen boyutu aralığında mı?
+        if not (5 < radius < 20):
+            continue
+
+        # Konturun daireselliğine bakalım
+        peri = cv2.arcLength(cnt, True)
+        if peri <= 0:
+            continue
+
+        circularity = 4.0 * np.pi * area / (peri * peri)  # 1'e yakınsa dairesel
+        # Bounding box aspect ratio (uzun ince şekilleri elemek için)
+        rx, ry, rw, rh = cv2.boundingRect(cnt)
+        if rw == 0 or rh == 0:
+            continue
+        aspect = max(rw, rh) / float(min(rw, rh))  # dairede ≈1, çubukta >>1
+
+        # Istakayı elemek için:
+        # - circularity çok düşükse (çok eliptik/çubuk)
+        # - aspect ratio çok yüksekse
+        if circularity < 0.6:
+            continue
+        if aspect > 1.8:
+            continue
+
+        # Skoru alan * circularity ile tartalım
+        score = area * circularity
+        if score > max_score:
+            max_score = score
             cand_center = (x, y)
             cand_radius = radius
 
