@@ -237,7 +237,7 @@ def parse_args():
         description="3 top bilardo videosunda ralli sınırlarını separator template'ine göre bulur."
     )
     parser.add_argument("video")
-    parser.add_argument("--template", default="frame_000000.jpg")
+    parser.add_argument("--template", default="template.jpg")
     parser.add_argument("--match-threshold", type=float, default=0.8)
     parser.add_argument("--expand-frames", type=int, default=29)
     parser.add_argument("--min-rally-length", type=int, default=90)
