@@ -388,58 +388,141 @@ class CollisionDetector:
         
         return None
 
+    def get_distance_between_balls(self, pos_white, pos_other, frame):
+        """İki top arasındaki mesafeyi hesapla"""
+        if frame not in pos_white or frame not in pos_other:
+            return None
+        x1, y1, _ = pos_white[frame]
+        x2, y2, _ = pos_other[frame]
+        return np.hypot(x1 - x2, y1 - y2)
+
     def verify_real_collision(self, pos_white, pos_other, frame, pre_window=6, post_window=8):
+        """
+        Gerçek bir çarpışma olup olmadığını doğrula.
+        Kriterler:
+        1. Çarpışma öncesi beyaz top hedef topa yaklaşıyor olmalı (mesafe azalıyor)
+        2. Çarpışma anında mesafe minimum olmalı
+        3. Çarpışma sonrası mesafe artmalı
+        4. En az bir topun yön veya hız değişikliği göstermesi
+        """
         pre_frames_w = sorted([f for f in pos_white.keys() if frame - pre_window <= f < frame])
         post_frames_w = sorted([f for f in pos_white.keys() if frame < f <= frame + post_window])
         pre_frames_o = sorted([f for f in pos_other.keys() if frame - pre_window <= f < frame])
         post_frames_o = sorted([f for f in pos_other.keys() if frame < f <= frame + post_window])
+        
         if len(pre_frames_o) < 2 or len(post_frames_o) < 2:
             return False
+        
+        # Hedef top öncesi ve sonrası hızları
         (pre_vx_o, pre_vy_o), pre_speed_o = self.get_velocity(pos_other, pre_frames_o)
         (post_vx_o, post_vy_o), post_speed_o = self.get_velocity(pos_other, post_frames_o)
+        
         other_was_stationary = pre_speed_o < 1.0
         other_started_moving = post_speed_o >= 1.5
+        
+        # DURUM 1: Hedef top duruyordu ve hareket etmeye başladı
+        # Bu kesinlikle beyaz topla çarpışma
         if other_was_stationary and other_started_moving:
             return True
+        
         if len(pre_frames_w) < 2 or len(post_frames_w) < 2:
             return other_was_stationary and other_started_moving
+        
+        # Beyaz top hızları
         (pre_vx_w, pre_vy_w), pre_speed_w = self.get_velocity(pos_white, pre_frames_w)
         (post_vx_w, post_vy_w), post_speed_w = self.get_velocity(pos_white, post_frames_w)
+        
         white_was_moving = pre_speed_w >= 1.0
         other_was_moving = pre_speed_o >= 1.0
+        
+        # DURUM 2: İki top da hareket ediyordu
+        # Bu durumda daha dikkatli kontrol gerekiyor
         if white_was_moving and other_was_moving:
+            # Kriter A: Mesafe yaklaşma/uzaklaşma kontrolü
+            # Çarpışma öncesi mesafe azalıyor olmalı, sonra artmalı
+            pre_distances = []
+            for f in pre_frames_w[-4:]:  # Son 4 frame
+                d = self.get_distance_between_balls(pos_white, pos_other, f)
+                if d is not None:
+                    pre_distances.append(d)
+            
+            post_distances = []
+            for f in post_frames_w[:4]:  # İlk 4 frame
+                d = self.get_distance_between_balls(pos_white, pos_other, f)
+                if d is not None:
+                    post_distances.append(d)
+            
+            # Mesafe trendi kontrolü
+            approaching = False
+            if len(pre_distances) >= 2:
+                # Çarpışma öncesi mesafe azalıyor mu?
+                dist_change_pre = pre_distances[-1] - pre_distances[0]
+                if dist_change_pre < -3:  # Mesafe en az 3 piksel azalmış
+                    approaching = True
+            
+            separating = False
+            if len(post_distances) >= 2:
+                # Çarpışma sonrası mesafe artıyor mu?
+                dist_change_post = post_distances[-1] - post_distances[0]
+                if dist_change_post > 3:  # Mesafe en az 3 piksel artmış
+                    separating = True
+            
+            # Eğer yaklaşma ve uzaklaşma yoksa, bu gerçek çarpışma değil
+            if not approaching and not separating:
+                return False
+            
+            # Kriter B: Yön değişikliği kontrolü
             pre_angle_w = self.get_direction_angle(pre_vx_w, pre_vy_w)
             post_angle_w = self.get_direction_angle(post_vx_w, post_vy_w)
             pre_angle_o = self.get_direction_angle(pre_vx_o, pre_vy_o)
             post_angle_o = self.get_direction_angle(post_vx_o, post_vy_o)
+            
             white_changed_dir = False
             other_changed_dir = False
+            
             if pre_angle_w is not None and post_angle_w is not None:
                 angle_diff_w = abs(pre_angle_w - post_angle_w)
                 if angle_diff_w > np.pi:
                     angle_diff_w = 2 * np.pi - angle_diff_w
-                if angle_diff_w > 0.3:
+                if angle_diff_w > 0.4:  # ~23 derece
                     white_changed_dir = True
+            
             if pre_angle_o is not None and post_angle_o is not None:
                 angle_diff_o = abs(pre_angle_o - post_angle_o)
                 if angle_diff_o > np.pi:
                     angle_diff_o = 2 * np.pi - angle_diff_o
-                if angle_diff_o > 0.3:
+                if angle_diff_o > 0.4:  # ~23 derece
                     other_changed_dir = True
+            
+            # Kriter C: Hız değişikliği kontrolü
             speed_change_w = abs(post_speed_w - pre_speed_w)
             speed_change_o = abs(post_speed_o - pre_speed_o)
-            white_changed_speed = speed_change_w > 1.5
-            other_changed_speed = speed_change_o > 1.5
-            if white_changed_dir or other_changed_dir:
-                return True
-            if white_changed_speed and other_changed_speed:
-                return True
+            white_changed_speed = speed_change_w > 2.0
+            other_changed_speed = speed_change_o > 2.0
+            
+            # Gerçek çarpışma kriterleri:
+            # 1. Yaklaşma + uzaklaşma + en az bir topun yön değişikliği
+            # 2. Yaklaşma + uzaklaşma + her iki topun hız değişikliği
+            if approaching and separating:
+                if white_changed_dir or other_changed_dir:
+                    return True
+                if white_changed_speed and other_changed_speed:
+                    return True
+            
+            # Sadece yaklaşma veya uzaklaşma varsa, her iki topun da değişmesi gerekir
+            if approaching or separating:
+                if (white_changed_dir or white_changed_speed) and (other_changed_dir or other_changed_speed):
+                    return True
+            
             return False
+        
+        # DURUM 3: Beyaz hareket ediyordu, hedef duruyordu
         if white_was_moving and not other_was_moving:
             if other_started_moving:
                 return True
             if post_speed_o > pre_speed_o + 0.5:
                 return True
+        
         return False
 
 def parse_args():
