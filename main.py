@@ -304,6 +304,90 @@ class CollisionDetector:
             return None
         return np.arctan2(vy, vx)
 
+    def check_collision_by_target_movement(self, frame_idx, name2):
+        """
+        Beyaz top tespit edilemediğinde, hedef topun aniden hareket etmeye
+        başlamasını çarpışma kanıtı olarak kullan.
+        Bilardo topları kendi kendine hareket etmez - eğer bir top duruyordu
+        ve aniden hareket etmeye başladıysa, beyaz top ona çarpmış demektir.
+        """
+        if name2 == "red":
+            pos_target = self.pos_red
+            last_collision = self.last_collision_red
+            confirmed_set = self.confirmed_red
+        else:
+            pos_target = self.pos_yellow
+            last_collision = self.last_collision_yellow
+            confirmed_set = self.confirmed_yellow
+        
+        # En az 15 frame veri gerekli
+        if len(pos_target) < 15:
+            return None
+        
+        # Son 10 frame'de hedef topun hareketi
+        recent_window = 10
+        recent_frames = sorted([f for f in pos_target.keys() if frame_idx - recent_window <= f <= frame_idx])
+        
+        if len(recent_frames) < 5:
+            return None
+        
+        # Daha önceki frame'lerde top duruyordu mu? (önceki 10-20 frame)
+        pre_start = frame_idx - recent_window - 10
+        pre_end = frame_idx - recent_window
+        pre_frames = sorted([f for f in pos_target.keys() if pre_start <= f < pre_end])
+        
+        if len(pre_frames) < 5:
+            return None
+        
+        # Önceki hız
+        _, pre_speed = self.get_velocity(pos_target, pre_frames)
+        
+        # Şimdiki hız
+        _, current_speed = self.get_velocity(pos_target, recent_frames)
+        
+        # Top duruyordu ve şimdi hareket ediyorsa → çarpışma var
+        was_stationary = pre_speed < 0.8
+        now_moving = current_speed >= 2.0
+        
+        if was_stationary and now_moving:
+            # Hareketin başladığı frame'i bul
+            movement_start_frame = None
+            all_frames_sorted = sorted(pos_target.keys())
+            
+            for i in range(1, len(all_frames_sorted)):
+                f1, f2 = all_frames_sorted[i-1], all_frames_sorted[i]
+                if f1 not in pos_target or f2 not in pos_target:
+                    continue
+                x1, y1, _ = pos_target[f1]
+                x2, y2, _ = pos_target[f2]
+                dist = np.hypot(x2 - x1, y2 - y1)
+                # Frame başına 2 pikselden fazla hareket = hareket başladı
+                if dist > 2.0 and f2 > pre_end:
+                    movement_start_frame = f1
+                    break
+            
+            if movement_start_frame is None:
+                movement_start_frame = recent_frames[0]
+            
+            # Bu frame zaten onaylanmış mı veya çok yakın bir çarpışma var mı?
+            if movement_start_frame in confirmed_set:
+                return None
+            if movement_start_frame - last_collision < self.min_frame_gap:
+                return None
+            
+            # Çarpışmayı onayla
+            confirmed_set.add(movement_start_frame)
+            if name2 == "red":
+                self.last_collision_red = movement_start_frame
+                self.collisions_red.append(movement_start_frame)
+            else:
+                self.last_collision_yellow = movement_start_frame
+                self.collisions_yellow.append(movement_start_frame)
+            
+            return movement_start_frame
+        
+        return None
+
     def verify_real_collision(self, pos_white, pos_other, frame, pre_window=6, post_window=8):
         pre_frames_w = sorted([f for f in pos_white.keys() if frame - pre_window <= f < frame])
         post_frames_w = sorted([f for f in pos_white.keys() if frame < f <= frame + post_window])
@@ -520,6 +604,16 @@ def main():
         coll_yellow = collision_detector.check_collision(frame_idx, "yellow")
         if coll_yellow is not None:
             event_history.append(f"F{coll_yellow}: WHITE-YELLOW")
+        
+        # Beyaz top tespit edilemediğinde, hedef topun harekete geçmesiyle çarpışma tespiti
+        if len(collision_detector.collisions_red) == 0:
+            coll_red_alt = collision_detector.check_collision_by_target_movement(frame_idx, "red")
+            if coll_red_alt is not None:
+                event_history.append(f"F{coll_red_alt}: WHITE-RED (hareket)")
+        if len(collision_detector.collisions_yellow) == 0:
+            coll_yellow_alt = collision_detector.check_collision_by_target_movement(frame_idx, "yellow")
+            if coll_yellow_alt is not None:
+                event_history.append(f"F{coll_yellow_alt}: WHITE-YELLOW (hareket)")
         rally_summary = None
         if is_rally_end or is_last_rally_end:
             rally_end = frame_idx
