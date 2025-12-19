@@ -217,8 +217,7 @@ def main():
         frame_idx += 1
     
     cv2.destroyAllWindows()
-    
-    # Sonuçları yazdır
+
     print("\n=== GENEL SONUCLAR ===")
     print(f"Toplam ralli sayisi: {len(rally_results)}")
     success_count = sum(1 for r in rally_results if r["success"])
